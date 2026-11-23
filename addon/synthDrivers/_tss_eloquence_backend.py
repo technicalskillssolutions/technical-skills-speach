@@ -1,0 +1,1072 @@
+# Copyright (C) 2009-2019 eloquence fans
+# synthDrivers/eci.py
+# todo: possibly add to this
+import gui
+import wx
+import ctypes
+import dataclasses
+import winsound
+
+try:
+	from speech import (
+		IndexCommand,
+		CharacterModeCommand,
+		LangChangeCommand,
+		BreakCommand,
+		PitchCommand,
+		RateCommand,
+		VolumeCommand,
+		PhonemeCommand,
+	)
+except ImportError:
+	from speech.commands import (
+		IndexCommand,
+		CharacterModeCommand,
+		LangChangeCommand,
+		BreakCommand,
+		PitchCommand,
+		RateCommand,
+		VolumeCommand,
+		PhonemeCommand,
+	)
+
+try:
+	from driverHandler import NumericDriverSetting, BooleanDriverSetting, DriverSetting
+except ImportError:
+	from autoSettingsUtils.driverSetting import (
+		BooleanDriverSetting,
+		DriverSetting,
+		NumericDriverSetting,
+	)
+
+try:
+	from autoSettingsUtils.utils import StringParameterInfo
+except ImportError:
+
+	class StringParameterInfo:
+		def __init__(self, value, label):
+			self.value = value
+			self.label = label
+
+
+from ctypes import *
+import ctypes.wintypes
+import synthDriverHandler
+import os
+import config
+import logging
+import core
+import globalVars
+from synthDriverHandler import (
+	SynthDriver,
+	synthIndexReached,
+	synthDoneSpeaking,
+)
+from . import _eloquence
+from . import _eloquence_text
+from ._background_work import BackgroundWork
+from collections import OrderedDict
+import addonHandler
+
+addonHandler.initTranslation()
+
+log = logging.getLogger(__name__)
+
+
+minRate = 40
+maxRate = 150
+VOICE_BCP47 = {
+	"enu": "en-US",
+	"eng": "en-GB",
+	"esp": "es-ES",
+	"esm": "es-419",
+	"ptb": "pt-BR",
+	"fra": "fr-FR",
+	"frc": "fr-CA",
+	"deu": "de-DE",
+	"ita": "it-IT",
+	"fin": "fi-FI",
+	"chs": "zh-CN",  # Simplified Chinese
+	"jpn": "ja-JP",  # Japanese
+	"kor": "ko-KR",  # Korean
+}
+
+VOICE_CODE_TO_ID = {code: str(info[0]) for code, info in _eloquence.langs.items()}
+VOICE_ID_TO_BCP47 = {
+	voice_id: VOICE_BCP47.get(code) for code, voice_id in VOICE_CODE_TO_ID.items() if VOICE_BCP47.get(code)
+}
+LANGUAGE_TO_VOICE_ID = {
+	lang.lower(): VOICE_CODE_TO_ID[code] for code, lang in VOICE_BCP47.items() if code in VOICE_CODE_TO_ID
+}
+PRIMARY_LANGUAGE_TO_VOICE_IDS = {}
+for code, lang in VOICE_BCP47.items():
+	voice_id = VOICE_CODE_TO_ID.get(code)
+	if not voice_id:
+		continue
+	primary = lang.split("-", 1)[0].lower()
+	PRIMARY_LANGUAGE_TO_VOICE_IDS.setdefault(primary, []).append(voice_id)
+
+variants = {
+	1: "Reed",
+	2: "Shelly",
+	3: "Bobby",
+	4: "Rocko",
+	5: "Glen",
+	6: "Sandy",
+	7: "Grandma",
+	8: "Grandpa",
+}
+
+
+class EloquenceSettingsPanel(gui.settingsDialogs.SettingsPanel):
+	# Translators: Name of the category for this add-on in the settings dialog
+	title = _("Eloquence")
+
+	def makeSettings(self, settings):
+		try:
+			sHelper = gui.guiHelper.BoxSizerHelper(self, sizer=settings)
+
+			# Engine selection.  Changing this takes effect when the synthesizer is
+			# next loaded, because an engine is chosen while opening it.
+			# Only engines actually present in this add-on are offered, so the list
+			# always starts with the helper and grows with what the build carries.
+			self.directEngines = [None] + [
+				engine for engine in _eloquence.DIRECT_ENGINE_NAMES if _eloquence.direct_engine_available(engine)
+			]
+			engine_labels = [
+				# Translators: Choice in the Eloquence settings for using only the 32-bit helper.
+				_("None (32-bit helper only)"),
+			]
+			for engine in self.directEngines[1:]:
+				version = _eloquence.direct_engine_version(engine) or _("unknown version")
+				engine_labels.append(f"{_eloquence.DIRECT_ENGINE_NAMES[engine]} {version}")
+			self.directEngineChoice = sHelper.addLabeledControl(
+				# Translators: Label of a combobox in the Eloquence category of the settings dialog
+				_("64-bit engine:"),
+				wx.Choice,
+				choices=engine_labels,
+			)
+			selected = _eloquence.selected_direct_engine()
+			self.directEngineChoice.SetSelection(
+				self.directEngines.index(selected) if selected in self.directEngines else 0
+			)
+			sHelper.addItem(
+				wx.StaticText(
+					self,
+					label=_(
+						# Translators: Explains the 64-bit engine option.
+						"A 64-bit engine runs inside NVDA, with no helper process. openevv "
+						"currently supports English only; ReLoq C supports every language. "
+						"Any language the chosen engine lacks falls back to the 32-bit helper "
+						"automatically. Takes effect when the synthesizer is next loaded."
+					),
+				)
+			)
+
+			self.dictionarySources = {
+				"https://github.com/mohamed00/AltIBMTTSDictionaries": "Alternative IBM TTS Dictionaries",
+				"https://github.com/eigencrow/IBMTTSDictionaries": "IBM TTS Dictionaries",
+			}
+
+			self.dictionaryChoice = sHelper.addLabeledControl(
+				# Translators: Label of a combobox in the Eloquence category of the settings dialog
+				_("Dictionary:"),
+				wx.Choice,
+				choices=list(self.dictionarySources.values()),
+			)
+			self.dictionaryChoice.SetStringSelection(
+				config.conf.get("eloquence", {}).get("dictionary_name", "Alternative IBM TTS Dictionaries")
+			)
+
+			# Translators: Button that downloads and applies updates to the selected Eloquence dictionaries.
+			self.updateButton = sHelper.addItem(wx.Button(self, label=_("Update Dictionaries")))
+			self.Bind(wx.EVT_BUTTON, self.onUpdate, self.updateButton)
+			# When NVDA is running in secure mode, one should not be able to save any setting to disk.
+			if globalVars.appArgs.secure:
+				self.updateButton.Disable()
+
+			# Tool to automate copying eloquence_host32.exe for 64-bit NVDA secure screens
+			self.copyHelperButton = sHelper.addItem(
+				# Translators: Label of a button in the Eloquence category of the settings dialog
+				wx.Button(self, label=_("Copy Helper to System Config (for Logon Screen)"))
+			)
+			self.Bind(wx.EVT_BUTTON, self.onCopyHelper, self.copyHelperButton)
+			# Copying helper from secure mode is not allowed, following "Use NVDA during sign-in" button behaviour in
+			# NVDA's General settings category.
+			if globalVars.appArgs.secure:
+				self.copyHelperButton.Disable()
+
+			# NEW: Auto-update addon button
+			# Translators: Label of a button in the Eloquence category of the settings dialog
+			self.addonUpdateButton = sHelper.addItem(wx.Button(self, label=_("Check for Add-on Updates")))
+			self.Bind(wx.EVT_BUTTON, self.onCheckAddonUpdate, self.addonUpdateButton)
+			# Add-on updates are not allowed in secure mode.
+			if globalVars.appArgs.secure:
+				self.addonUpdateButton.Disable()
+		except Exception as e:
+			log.error(f"Error creating Eloquence settings panel: {e}")
+			# Panel creation failed, but don't crash - synth will still work
+
+	def onCopyHelper(self, evt):
+		"""Copies the Eloquence Host Process with UAC elevation and definitive feedback.
+
+		The host ships as a PyInstaller onedir tree and resolves its ``_internal``
+		directory relative to the executable, so the whole directory has to go
+		across -- copying the .exe on its own leaves a host that cannot start.
+		"""
+		source_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "eloquence_host32"))
+		prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+		target_addon_dir = os.path.normpath(
+			os.path.join(prog_files, "NVDA", "systemConfig", "addons", "Eloquence")
+		)
+
+		# Security check: Ensure the target addon directory exists in systemConfig
+		if not os.path.isdir(target_addon_dir):
+			wx.MessageBox(
+				_(
+					# Translators: Text of a message dialog when copying the helper to system config
+					"Eloquence folder not found in systemConfig.\n\nPlease go to NVDA Settings > General and click 'Use currently saved settings during sign-in' first to initialize folders."
+				),
+				# Translators: Title of a message dialog when copying the helper to system config
+				_("Folder Missing"),
+				wx.OK | wx.ICON_WARNING,
+			)
+			return
+
+		dest_dir = os.path.normpath(os.path.join(target_addon_dir, "synthDrivers"))
+		dest_host_dir = os.path.normpath(os.path.join(dest_dir, "eloquence_host32"))
+
+		if not os.path.isdir(source_dir):
+			wx.MessageBox(
+				# Translators: Text of a message dialog when copying the helper to system config
+				_("Source folder not found at:\n{source_dir}").format(source_dir=source_dir),
+				# Translators: Title of a message dialog when copying the helper to system config
+				_("Error"),
+				wx.OK | wx.ICON_ERROR,
+			)
+			return
+
+		# Prepare elevated command: ensure subdirectory exists and copy the helper
+		# tree.  xcopy /E /I /Y writes the contents of source_dir into
+		# dest_host_dir, creating it and overwriting without prompting.
+		cmd_params = f'/c mkdir "{dest_dir}" 2>nul & xcopy /E /I /Y "{source_dir}" "{dest_host_dir}"'
+
+		try:
+			# Triggering UAC Elevation using ShellExecuteW's "runas" verb
+			ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", cmd_params, None, 0)
+
+			if ret > 32:
+				# Play Windows Asterisk sound for confirmation of successful launch
+				winsound.MessageBeep(winsound.MB_ICONASTERISK)
+				wx.MessageBox(
+					_(
+						# Translators: text of a message dialog when copying the helper to system config
+						"Successfully copied the Eloquence helper to systemConfig!\n\nEloquence should now load normally on logon screen, start-up, and other secure screens."
+					),
+					# Translators: Title of a message dialog when copying the helper to system config
+					_("Success"),
+					wx.OK | wx.ICON_INFORMATION,
+				)
+			elif ret == 5:
+				# SE_ERR_ACCESSDENIED: Elevation prompt was declined
+				wx.MessageBox(
+					# Translators: Text of a message dialog when copying the helper to system config
+					_("Copy process was cancelled or permission was denied by the user."),
+					# Translators: Title of a message dialog when copying the helper to system config
+					_("Cancelled"),
+					wx.OK | wx.ICON_ERROR,
+				)
+			else:
+				wx.MessageBox(
+					# Translators: Text of a message dialog when copying the helper to system config
+					_("An error occurred while attempting to copy the file. (Error Code: {ret})").format(
+						ret=ret
+					),
+					# Translators: Title of a message dialog when copying the helper to system config
+					_("Error"),
+					wx.OK | wx.ICON_ERROR,
+				)
+		except Exception as e:
+			wx.MessageBox(
+				# Translators: Text of a message dialog when copying the helper to system config
+				_("An unexpected error occurred: {e}").format(e=str(e)),
+				# Translators: Title of a message dialog when copying the helper to system config
+				_("Error"),
+				wx.OK | wx.ICON_ERROR,
+			)
+
+	def onCheckAddonUpdate(self, evt):
+		"""Check for and apply addon updates from GitHub"""
+		try:
+			from . import _eloquence_updater
+
+			manager = _eloquence_updater.EloquenceUpdateManager(os.path.abspath(os.path.dirname(__file__)))
+		except Exception as e:
+			self._reportAddonUpdateError(e)
+			return
+
+		BackgroundWork(
+			self,
+			# Translators: Title of a progress dialog when updating the add-on
+			_("Checking for Updates"),
+			# Translators: Message of a progress dialog when updating the add-on
+			_("Checking for updates..."),
+			lambda is_cancelled, report: manager.check_for_updates(),
+			lambda update, cancelled: self._onAddonUpdateChecked(manager, cancelled, *update),
+			self._reportAddonUpdateError,
+		)
+
+	def _onAddonUpdateChecked(self, manager, cancelled, has_update, latest_version, download_url, changelog):
+		if cancelled:
+			self._reportAddonUpdateCancelled()
+			return
+		if not has_update:
+			wx.MessageBox(
+				# Translators: Text of a message dialog when updating the add-on
+				_("You are using the latest version!"),
+				# Translators: Title of a message dialog when updating the add-on
+				_("Up to Date"),
+				wx.OK | wx.ICON_INFORMATION,
+			)
+			return
+
+		changelog_dialog = wx.MessageDialog(
+			self,
+			_(
+				# Translators: Text of a message dialog when updating the add-on
+				"New version available: {latest_version}\n\n"
+				"Current version: {currVersion}\n\n"
+				"Changelog:\n{changelog}\n\n"
+				"Would you like to download and review the update?"
+			).format(
+				latest_version=latest_version,
+				currVersion=manager.CURRENT_VERSION,
+				changelog=changelog[:500],
+			),
+			# Translators: Title of a message dialog when updating the add-on
+			_("Update Available"),
+			wx.YES_NO | wx.ICON_INFORMATION,
+		)
+
+		if changelog_dialog.ShowModal() != wx.ID_YES:
+			return
+
+		BackgroundWork(
+			self,
+			# Translators: Text of a progress dialog when updating the add-on
+			_("Downloading Update"),
+			# Translators: Title of a progress dialog when updating the add-on
+			_("Downloading..."),
+			lambda is_cancelled, report: manager.download_update(download_url, report, is_cancelled),
+			lambda addon_path, cancelled: self._installAddonUpdate(manager, addon_path, cancelled),
+			self._reportAddonUpdateError,
+			# Translators: The download has finished; closing this dialog continues the add-on installation.
+			doneMessage=_(
+				"Download complete. You can now close this dialog to continue installing the update."
+			),
+		)
+
+	def _installAddonUpdate(self, manager, addon_path, cancelled):
+		"""Hands the downloaded Add-on Package to NVDA's installer, which must run on the UI thread."""
+		if cancelled:
+			manager.cleanup()
+			self._reportAddonUpdateCancelled()
+			return
+		try:
+			installed = manager.install_update(addon_path, self)
+		except Exception as e:
+			self._reportAddonUpdateError(e)
+			return
+		finally:
+			manager.cleanup()
+		if not installed:
+			self._reportAddonUpdateCancelled()
+			return
+		manager.prompt_for_restart()
+
+	def _reportAddonUpdateCancelled(self):
+		wx.MessageBox(
+			# Translators: Text of a message dialog when updating the add-on
+			_("Update cancelled."),
+			# Translators: Text of a message dialog when updating the add-on
+			_("Cancelled"),
+			wx.OK | wx.ICON_INFORMATION,
+		)
+
+	def _reportAddonUpdateError(self, e):
+		from . import _eloquence_updater
+
+		if isinstance(e, _eloquence_updater.UpdateCancelled):
+			self._reportAddonUpdateCancelled()
+			return
+		log.error(f"Update failed: {e}")
+		wx.MessageBox(
+			_(
+				# Translators: Text of a message dialog when updating the add-on
+				"Update failed: {e}\n\nYour addon has not been modified."
+			).format(e=str(e)),
+			# Translators: Title of a message dialog when updating the add-on
+			_("Update Failed"),
+			wx.OK | wx.ICON_ERROR,
+		)
+
+	def onSave(self):
+		if "eloquence" not in config.conf:
+			config.conf["eloquence"] = {}
+		engine = self.directEngines[self.directEngineChoice.GetSelection()]
+		config.conf["eloquence"]["direct_engine"] = engine or "none"
+		selection = self.dictionaryChoice.GetStringSelection()
+		for url, name in self.dictionarySources.items():
+			if name == selection:
+				config.conf["eloquence"]["dictionary_name"] = name
+				config.conf["eloquence"]["dictionary_url"] = url
+				break
+
+	def onUpdate(self, evt):
+		from . import _dictionary_update
+
+		self.onSave()
+		dictionary_url = config.conf.get("eloquence", {}).get("dictionary_url")
+		if not dictionary_url:
+			wx.MessageBox(
+				# Translators: Text of a message dialog when updating a dictionary
+				_("Please select a dictionary first."),
+				# Translators: Title of a message dialog when updating a dictionary
+				_("Error"),
+				wx.OK | wx.ICON_ERROR,
+			)
+			return
+
+		dictionary_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "eloquence")
+		stage_messages = {
+			# Translators: Message of a progress dialog when updating a dictionary
+			_dictionary_update.UpdateStage.DOWNLOADING: _("Downloading dictionaries..."),
+			# Translators: Message of a progress dialog when updating a dictionary
+			_dictionary_update.UpdateStage.MERGING: _("Merging dictionaries..."),
+		}
+
+		BackgroundWork(
+			self,
+			# Translators: Title of a progress dialog when updating a dictionary
+			_("Updating Dictionaries"),
+			stage_messages[_dictionary_update.UpdateStage.DOWNLOADING],
+			lambda is_cancelled, report: _dictionary_update.update_dictionaries(
+				dictionary_url,
+				dictionary_dir,
+				is_cancelled,
+				lambda stage: report(None, stage_messages[stage]),
+			),
+			self._reportDictionaryUpdate,
+			self._reportDictionaryUpdateError,
+		)
+
+	def _reportDictionaryUpdate(self, result, cancelled):
+		# result.cancelled says whether the update itself stopped early; a late Cancel press changed nothing.
+		paragraphs = []
+		if result.changed:
+			paragraphs.append(
+				# Translators: Part of the message shown after a dictionary update
+				_("Entries added: {entries}\nDictionary files changed: {files}").format(
+					entries=result.entries_added, files=len(result.changed)
+				)
+			)
+			# Translators: Part of the message shown after a dictionary update
+			paragraphs.append(_("The new entries take effect the next time Eloquence starts."))
+		if result.failed:
+			paragraphs.append(
+				# Translators: Part of the message shown after a dictionary update. A list of files follows.
+				_("These dictionary files could not be updated:")
+				+ "".join(f"\n{outcome.filename}: {outcome.error}" for outcome in result.failed)
+			)
+
+		if result.cancelled:
+			# Translators: Part of the message shown after a dictionary update
+			summary = _("Dictionary update cancelled.")
+			# Translators: Title of a message dialog when updating a dictionary
+			title, icon = _("Cancelled"), wx.ICON_INFORMATION
+		elif result.failed and not result.changed:
+			# Translators: Part of the message shown after a dictionary update
+			summary = _("Dictionary update failed.")
+			# Translators: Title of a message dialog when updating a dictionary
+			title, icon = _("Error"), wx.ICON_ERROR
+		elif result.failed:
+			# Translators: Part of the message shown after a dictionary update
+			summary = _("Dictionary update finished, but some files failed.")
+			# Translators: Title of a message dialog when updating a dictionary
+			title, icon = _("Eloquence"), wx.ICON_WARNING
+		elif result.changed:
+			# Translators: Part of the message shown after a dictionary update
+			summary = _("Dictionary update successful!")
+			# Translators: Title of a message dialog when updating a dictionary
+			title, icon = _("Success"), wx.ICON_INFORMATION
+		else:
+			# Translators: Text of a message dialog when updating a dictionary
+			summary = _("No new updates found. Your dictionaries are already up to date.")
+			# Translators: Title of a message dialog when updating a dictionary
+			title, icon = _("Eloquence"), wx.ICON_INFORMATION
+		wx.MessageBox("\n\n".join([summary, *paragraphs]), title, wx.OK | icon)
+
+	def _reportDictionaryUpdateError(self, e):
+		log.error(f"Dictionary update failed: {e}")
+		wx.MessageBox(
+			# Translators: Text of a message dialog when updating a dictionary
+			_("An error occurred while updating the dictionary: {e}").format(e=e),
+			# Translators: Title of a message dialog when updating a dictionary
+			_("Error"),
+			wx.OK | wx.ICON_ERROR,
+		)
+
+
+class SynthDriver(synthDriverHandler.SynthDriver):
+	# The original stand-alone Eloquence settings panel is intentionally not
+	# registered here. Technical Skills Speech exposes one unified driver UI.
+	settingsPanel = None
+	supportedSettings = (
+		SynthDriver.VoiceSetting(),
+		SynthDriver.VariantSetting(),
+		SynthDriver.RateSetting(),
+		SynthDriver.PitchSetting(),
+		SynthDriver.InflectionSetting(),
+		SynthDriver.VolumeSetting(),
+		# Translators: A synth setting available in speech settings dialog
+		NumericDriverSetting("hsz", _("Hea&d size")),
+		# Translators: A synth setting available in speech settings dialog
+		NumericDriverSetting("rgh", _("Rou&ghness")),
+		# Translators: A synth setting available in speech settings dialog
+		NumericDriverSetting("bth", _("Breathi&ness")),
+		BooleanDriverSetting(
+			# Translators: A synth setting available in speech settings dialog
+			"backquoteVoiceTags",
+			_("Enable backquote voice &tags"),
+			True,
+		),
+		# Translators: A synth setting available in speech settings dialog
+		BooleanDriverSetting("ABRDICT", _("Enable &abbreviation dictionary"), False),
+		# Translators: A synth setting available in speech settings dialog
+		BooleanDriverSetting("phrasePrediction", _("Enable phras&e prediction"), False),
+		# Translators: A synth setting available in speech settings dialog
+		DriverSetting("pauseMode", _("Shorten &pauses"), defaultVal="0"),
+		# Translators: A synth setting available in speech settings dialog
+		DriverSetting("sampleRate", _("Sample &rate"), defaultVal="11025"),
+		# Translators: A synth setting available in speech settings dialog. A
+		# contour shapes the synthesizer's audio after it is produced.
+		DriverSetting("contour", _("Audio conto&ur"), defaultVal="raw"),
+	)
+	supportedCommands = {
+		IndexCommand,
+		CharacterModeCommand,
+		LangChangeCommand,
+		BreakCommand,
+		PitchCommand,
+		RateCommand,
+		VolumeCommand,
+		PhonemeCommand,
+	}
+	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
+	PROSODY_ATTRS = {
+		PitchCommand: _eloquence.pitch,
+		VolumeCommand: _eloquence.vlm,
+		RateCommand: _eloquence.rate,
+	}
+
+	description = "ETI-Eloquence"
+	name = "eloquence"
+
+	# Initialize _pause_mode at class level to prevent issues with setting restoration
+	_pause_mode = 0
+
+	@classmethod
+	def check(cls):
+		try:
+			log.info("Eloquence: Running check() to verify synth is available")
+			result = _eloquence.eciCheck()
+			log.info(f"Eloquence: check() returned {result}")
+			return result
+		except Exception as e:
+			log.error(f"Eloquence: check() failed with error: {e}", exc_info=True)
+			return False
+
+	def __init__(self):
+		# Unified settings are exposed by Technical Skills Speech.
+
+		try:
+			log.info("Eloquence: Starting initialization")
+			_eloquence.initialize(self._onIndexReached)
+			log.info("Eloquence: _eloquence.initialize completed successfully")
+		except Exception as e:
+			log.error(f"Eloquence: Failed to initialize _eloquence module: {e}", exc_info=True)
+			raise
+
+		try:
+			voice_param = _eloquence.params.get(9)
+			if voice_param is None:
+				configured_voice = config.conf.get("speech", {}).get("eci", {}).get("voice", "enu")
+				voice_info = _eloquence.langs.get(configured_voice) or _eloquence.langs.get("enu")
+				voice_param = voice_info[0] if voice_info else 65536
+			self._update_voice_state(voice_param, update_default=True)
+			# Initialize _rate first before setting the rate property
+			self._rate = self._percentToParam(50, minRate, maxRate)
+			self.rate = 50
+			self.variant = "1"
+			self._pause_mode = 0
+			log.info("Eloquence: Initialization completed successfully")
+		except Exception as e:
+			log.error(f"Eloquence: Failed during voice/parameter setup: {e}", exc_info=True)
+			raise
+
+		# One-time migration notice for users updating from multiprocessing-based IPC
+		try:
+			eci_conf = config.conf.get("speech", {}).get("ibmeci")
+			eloquence_conf = config.conf.get("eloquence", {})
+			if eci_conf is not None and not eloquence_conf.get("ipc_migration_notice_shown", False):
+
+				def _show_migration_notice():
+					if "eloquence" not in config.conf:
+						config.conf["eloquence"] = {}
+					config.conf["eloquence"]["ipc_migration_notice_shown"] = True
+					config.conf.save()
+					wx.CallAfter(
+						gui.messageBox,
+						_(
+							"Eloquence has been updated with a new communication system.\n\n"
+							"If you use Eloquence on secure screens (logon screen, UAC prompts), "
+							"please go to NVDA Settings > Eloquence and click "
+							"'Copy Helper to System Config' to update the secure screen copy.\n\n"
+							"This message will only appear once."
+						),
+						_("Eloquence Update Notice"),
+						wx.OK | wx.ICON_INFORMATION,
+					)
+
+				self._migration_func = _show_migration_notice
+				core.postNvdaStartup.register(self._migration_func)
+		except Exception:
+			pass  # Never let a notice prevent the synth from working
+
+	def terminate(self):
+		_eloquence.close_audio()
+		# Shut the 32-bit host process down. Without this the host is never asked
+		# to exit, so its onefile bootloader never removes the _MEI directory it
+		# extracted, and its in-flight sends die on a reset socket rather than a
+		# closed one. Wrapped so a shutdown failure cannot block switching away
+		# from this synth.
+		try:
+			_eloquence.terminate()
+		except Exception:
+			log.exception("Eloquence host shutdown failed")
+
+		super(SynthDriver, self).terminate()
+
+	def combine_adjacent_strings(self, lst):
+		result = []
+		current_string = ""
+		for item in lst:
+			if isinstance(item, str):
+				current_string += item
+			else:
+				if current_string:
+					result.append(current_string)
+					current_string = ""
+				result.append(item)
+		if current_string:
+			result.append(current_string)
+		return result
+
+	def _build_options(self):
+		return _eloquence_text.BuildOptions(
+			volume=self.getVParam(_eloquence.vlm),
+			rate=self.rate,
+			pause_mode=self._pause_mode,
+			backquote_tags=self._backquoteVoiceTags,
+			abbreviation_dict=self._ABRDICT,
+			phrase_prediction=self._phrasePrediction,
+		)
+
+	def speak(self, speechSequence):
+		last = None
+		outlist = []
+		pending_indexes = []
+		queued_speech = False
+		options = self._build_options()
+		# What an in-process engine needs from the Text Builder is per fragment,
+		# because a mixed-language utterance can cross backends mid-sentence and
+		# the openevv bracket workaround may not reach any other engine.  Every
+		# variant is built once here rather than per fragment.
+		engine_options = {
+			_eloquence.OPENEVV: dataclasses.replace(options, openevv_bracket_fixes=True),
+		}
+		sequence_voice = getattr(self, "_defaultVoice", str(_eloquence.params.get(9, 65536)))
+		last_queued_engine_voice = getattr(self, "_lastEngineVoice", None)
+
+		# Reset prosody to baseline at the start of each utterance to prevent
+		# state leaks from previous speech sequences (issue #59).
+		for pr in (_eloquence.rate, _eloquence.pitch, _eloquence.vlm):
+			outlist.append((_eloquence.cmdProsody, (pr, 1, 0)))
+
+		if last_queued_engine_voice != sequence_voice:
+			try:
+				outlist.append((_eloquence.set_voice, (int(sequence_voice),)))
+				last_queued_engine_voice = sequence_voice
+			except (TypeError, ValueError):
+				log.debug("Skipping default voice reset for invalid voice id %r", sequence_voice)
+
+		# IBMTTS Logic: Combine strings before processing regex
+		speechSequence = self.combine_adjacent_strings(speechSequence)
+
+		for item in speechSequence:
+			if isinstance(item, str):
+				s = str(item)
+				fragment_options = engine_options.get(
+					_eloquence.direct_engine_for_voice(sequence_voice), options
+				)
+				# Only the first text sets the volume inline: a `vv anywhere later
+				# makes openevv end the phrase there, which at an index -- every line
+				# break in Say All -- is a pause in the middle of a sentence.
+				s = _eloquence_text.build(
+					s,
+					voice_id=sequence_voice,
+					options=fragment_options,
+					opens_utterance=last is None,
+				)
+				outlist.append((_eloquence.speak, (s,)))
+				last = s
+				queued_speech = True
+			elif isinstance(item, IndexCommand):
+				pending_indexes.append(item.index)
+				outlist.append((_eloquence.index, (item.index,)))
+			elif isinstance(item, BreakCommand):
+				fragment = _eloquence_text.break_fragment(item.time, options)
+				outlist.append((_eloquence.speak, (fragment,)))
+				queued_speech = True
+			elif isinstance(item, LangChangeCommand):
+				voice_id = self._resolve_voice_for_language(item.lang)
+				if voice_id is None:
+					log.debug("No Eloquence voice mapped for language '%s'", item.lang)
+					continue
+				voice_str = str(voice_id)
+				if voice_str == sequence_voice:
+					continue
+				try:
+					queued_voice = int(voice_id)
+				except (TypeError, ValueError):
+					log.debug(
+						"Skipping language change for '%s': invalid voice id %r",
+						item.lang,
+						voice_id,
+					)
+					continue
+				outlist.append((_eloquence.set_voice, (queued_voice,)))
+				sequence_voice = voice_str
+				last_queued_engine_voice = voice_str
+			elif type(item) in self.PROSODY_ATTRS:
+				pr = self.PROSODY_ATTRS[type(item)]
+				# Use the raw _offset/_multiplier values directly, NOT the
+				# computed properties.  NVDA guarantees that only one of them
+				# is specified (they are mutually exclusive).  The computed
+				# .multiplier property already folds offset into a ratio
+				# using the *current* defaultValue, so passing both would
+				# double-count the change.  Raw values are stable constants
+				# that do not depend on defaultValue and are safe to apply
+				# later in the worker thread against the live base pitch.
+				raw_offset = getattr(item, "_offset", 0)
+				raw_multiplier = getattr(item, "_multiplier", 1)
+				outlist.append(
+					(
+						_eloquence.cmdProsody,
+						(pr, raw_multiplier, raw_offset),
+					)
+				)
+		if not queued_speech:
+			# No speech queued. Ensure any state changes apply and emit indexes immediately
+			# so sayAll can advance even when there's nothing to speak.
+			for func, args in outlist:
+				if func is _eloquence.index:
+					continue
+				try:
+					func(*args)
+				except Exception:
+					log.exception("Synthesis command failed")
+			self._lastEngineVoice = last_queued_engine_voice
+			for index in pending_indexes:
+				self._onIndexReached(index)
+			self._onIndexReached(None)
+			return
+
+		if last is not None:
+			trailing_pause = _eloquence_text.trailing_pause(last, options)
+			if trailing_pause is not None:
+				outlist.append((_eloquence.speak, (trailing_pause,)))
+
+		outlist.append((_eloquence.index, (0xFFFF,)))
+		outlist.append((_eloquence.synth, ()))
+		self._lastEngineVoice = last_queued_engine_voice
+		seq = _eloquence.current_generation()
+		_eloquence.synth_queue.put((outlist, seq))
+		_eloquence.process()
+
+	# def cancel(self):
+	#  self.dll.eciStop(self.handle)
+
+	def pause(self, switch):
+		_eloquence.pause(switch)
+		#  self.dll.eciPause(self.handle,switch)
+
+	# Pause Mode Definitions:
+	# 0: Injects p0 at all punctuation for Legacy Speed.
+	# 1: Standard timing with a p1 pause at the end of speech blocks only.
+	# 2: Injects p1 at all punctuation for consistent Modern Shortening.
+	_pauseModes = {
+		# Translators: An option in the "Shorten pauses" combo box in speech settings
+		"0": StringParameterInfo("0", _("Never")),
+		# Translators: An option in the "Shorten pauses" combo box in speech settings
+		"1": StringParameterInfo("1", _("At end of text only")),
+		# Translators: An option in the "Shorten pauses" combo box in speech settings
+		"2": StringParameterInfo("2", _("Always")),
+	}
+
+	def _get_availablePausemodes(self):
+		return self._pauseModes
+
+	def _get_availableSamplerates(self):
+		"""The output rates the engines in this configuration actually offer.
+
+		The union across backends, not the intersection: an engine that cannot do
+		the chosen rate runs at its own best one and the Audio Playback Pipeline
+		follows whichever is speaking.  So with openevv selected the higher rates
+		are listed even though the proprietary engine tops out at 11025 -- picking
+		one costs a brief gap when an utterance crosses backends, which only
+		happens when a language openevv lacks appears mid-sentence.
+
+		Nothing is hardcoded here; see _eloquence.supported_sample_rates().
+		"""
+		rates = OrderedDict()
+		for rate in _eloquence.supported_sample_rates():
+			# Translators: An option in the "Sample rate" combo box in speech
+			# settings, giving an audio sample rate in hertz.
+			rates[str(rate)] = StringParameterInfo(str(rate), _("{rate} Hz").format(rate=rate))
+		return rates
+
+	def _get_sampleRate(self):
+		return str(_eloquence.requested_sample_rate())
+
+	def _set_sampleRate(self, val):
+		try:
+			rate = int(val)
+		except (TypeError, ValueError):
+			log.warning("Eloquence: ignoring unusable sample rate %r", val)
+			return
+		# Queued for the synthesis worker rather than applied here, so the engine's
+		# output buffer is never swapped mid-utterance; see
+		# _eloquence.set_sample_rate().  An engine that cannot do this rate runs at
+		# its own best one, which is why nothing is read back to confirm.
+		_eloquence.set_sample_rate(rate)
+
+	# Eloquence Contours.  The module only knows 11025 and 16000 Hz, and not every
+	# contour exists at both, so the labels say which rate each needs.  Audio at a
+	# rate a contour does not cover plays raw, which is also how a backend that
+	# cannot reach the chosen sample rate is handled; see _contours.MODES.
+	_contours = {
+		# Translators: An option in the "Audio contour" combo box in speech settings
+		"raw": StringParameterInfo("raw", _("Raw (no contour)")),
+		# Translators: An option in the "Audio contour" combo box in speech settings
+		"presence": StringParameterInfo("presence", _("Presence (11025 or 16000 Hz)")),
+		# Translators: An option in the "Audio contour" combo box in speech settings
+		"treble": StringParameterInfo("treble", _("Presence treble (11025 Hz only)")),
+		# Translators: An option in the "Audio contour" combo box in speech settings
+		"smooth": StringParameterInfo("smooth", _("Smooth (16000 Hz only)")),
+	}
+
+	def _get_availableContours(self):
+		return self._contours
+
+	def _get_contour(self):
+		return _eloquence.requested_contour()
+
+	def _set_contour(self, val):
+		_eloquence.set_contour(val)
+
+	def _set_pauseMode(self, val):
+		self._pause_mode = int(val)
+
+	def _get_pauseMode(self):
+		return str(self._pause_mode)
+
+	_backquoteVoiceTags = False
+	_ABRDICT = False
+	_phrasePrediction = False
+
+	def _get_backquoteVoiceTags(self):
+		return self._backquoteVoiceTags
+
+	def _set_backquoteVoiceTags(self, enable):
+		if enable == self._backquoteVoiceTags:
+			return
+		self._backquoteVoiceTags = enable
+
+	def _get_ABRDICT(self):
+		return self._ABRDICT
+
+	def _set_ABRDICT(self, enable):
+		if enable == self._ABRDICT:
+			return
+		self._ABRDICT = enable
+
+	def _get_phrasePrediction(self):
+		return self._phrasePrediction
+
+	def _set_phrasePrediction(self, enable):
+		if enable == self._phrasePrediction:
+			return
+		self._phrasePrediction = enable
+
+	def _get_rate(self):
+		return self._paramToPercent(self.getVParam(_eloquence.rate), minRate, maxRate)
+
+	def _set_rate(self, vl):
+		self._rate = self._percentToParam(vl, minRate, maxRate)
+		self.setVParam(_eloquence.rate, self._percentToParam(vl, minRate, maxRate))
+
+	def _get_pitch(self):
+		return self.getVParam(_eloquence.pitch)
+
+	def _set_pitch(self, vl):
+		self.setVParam(_eloquence.pitch, vl)
+
+	def _get_volume(self):
+		return self.getVParam(_eloquence.vlm)
+
+	def _set_volume(self, vl):
+		self.setVParam(_eloquence.vlm, int(vl))
+
+	def _set_inflection(self, vl):
+		vl = int(vl)
+		self.setVParam(_eloquence.fluctuation, vl)
+
+	def _get_inflection(self):
+		return self.getVParam(_eloquence.fluctuation)
+
+	def _set_hsz(self, vl):
+		vl = int(vl)
+		self.setVParam(_eloquence.hsz, vl)
+
+	def _get_hsz(self):
+		return self.getVParam(_eloquence.hsz)
+
+	def _set_rgh(self, vl):
+		vl = int(vl)
+		self.setVParam(_eloquence.rgh, vl)
+
+	def _get_rgh(self):
+		return self.getVParam(_eloquence.rgh)
+
+	def _set_bth(self, vl):
+		vl = int(vl)
+		self.setVParam(_eloquence.bth, vl)
+
+	def _get_bth(self):
+		return self.getVParam(_eloquence.bth)
+
+	def _getAvailableVoices(self):
+		o = OrderedDict()
+		for name in os.listdir(_eloquence.eciPath[:-8]):
+			if not name.lower().endswith(".syn"):
+				continue
+			voice_code = name.lower()[:-4]
+			info = _eloquence.langs[voice_code]
+			language = VOICE_BCP47.get(voice_code)
+			o[str(info[0])] = synthDriverHandler.VoiceInfo(str(info[0]), info[1], language)
+		return o
+
+	def _get_voice(self):
+		return getattr(self, "_defaultVoice", str(_eloquence.params[9]))
+
+	def _set_voice(self, vl):
+		_eloquence.set_voice(vl)
+		self._update_voice_state(vl, update_default=True)
+
+	def _update_voice_state(self, voice_id, update_default):
+		voice_str = str(voice_id)
+		try:
+			_eloquence.params[9] = int(voice_str)
+		except (TypeError, ValueError):
+			log.debug("Unable to coerce Eloquence voice id '%s' to int", voice_id)
+		if update_default or not getattr(self, "_defaultVoice", None):
+			self._defaultVoice = voice_str
+		self.curvoice = self._defaultVoice
+		self._lastEngineVoice = voice_str
+		self._languageOverrideActive = False
+
+	def _resolve_voice_for_language(self, language):
+		if not language:
+			return getattr(self, "_defaultVoice", None)
+		normalized = language.lower().replace("_", "-")
+		voice_id = LANGUAGE_TO_VOICE_ID.get(normalized)
+		if voice_id:
+			return voice_id
+		primary, _, region = normalized.partition("-")
+		default_voice = getattr(self, "_defaultVoice", None)
+		default_lang = VOICE_ID_TO_BCP47.get(default_voice) if default_voice else None
+		if default_lang:
+			default_primary, _, default_region = default_lang.lower().partition("-")
+			if default_primary == primary and (not region or default_region == region):
+				return default_voice
+		candidates = PRIMARY_LANGUAGE_TO_VOICE_IDS.get(primary, [])
+		if not candidates:
+			return None
+		if region:
+			for candidate in candidates:
+				candidate_tag = VOICE_ID_TO_BCP47.get(candidate)
+				if not candidate_tag:
+					continue
+				cand_primary, _, cand_region = candidate_tag.lower().partition("-")
+				if cand_primary == primary and cand_region == region:
+					return candidate
+			if primary == "es":
+				for candidate in candidates:
+					candidate_tag = VOICE_ID_TO_BCP47.get(candidate)
+					if candidate_tag and candidate_tag.lower().endswith("-419"):
+						return candidate
+		if default_lang and default_lang.lower().partition("-")[0] == primary:
+			return default_voice
+		return candidates[0]
+
+	def getVParam(self, pr):
+		return _eloquence.getVParam(pr)
+
+	def setVParam(self, pr, vl):
+		_eloquence.setVParam(pr, vl)
+
+	def _get_lastIndex(self):
+		# fix?
+		return _eloquence.lastindex
+
+	def cancel(self):
+		self._lastEngineVoice = None
+		self._languageOverrideActive = False
+		_eloquence.stop()
+
+	def _getAvailableVariants(self):
+		global variants
+		return OrderedDict(
+			(str(id), synthDriverHandler.VoiceInfo(str(id), name)) for id, name in variants.items()
+		)
+
+	def _set_variant(self, v):
+		global variants
+		self._variant = v if int(v) in variants else "1"
+		_eloquence.setVariant(int(v))
+		self.setVParam(_eloquence.rate, self._rate)
+		#  if 'eloquence' in config.conf['speech']:
+		#   config.conf['speech']['eloquence']['pitch'] = self.pitch
+
+	def _get_variant(self):
+		return self._variant
+
+	def _onIndexReached(self, index):
+		callback = getattr(self, "_tss_event_callback", None)
+		if callback is not None:
+			callback(self, "index" if index is not None else "done", index)
+		elif index is not None:
+			synthIndexReached.notify(synth=self, index=index)
+		else:
+			synthDoneSpeaking.notify(synth=self)

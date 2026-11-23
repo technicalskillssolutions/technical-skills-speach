@@ -1,0 +1,260 @@
+"""Text preprocessing and crash prevention for Eloquence synthesis.
+
+Contains regex-based crash prevention patterns ported from the IBMTTS NVDA
+add-on and text normalization utilities.  Provides a single public entry
+point -- ``preprocess()`` -- that applies the appropriate fixes for a given
+Eloquence voice.
+"""
+
+import ctypes
+import re
+import unicodedata
+
+from ._script_conversion import convert_traditional_to_simplified
+
+
+# Eloquence can finish synthesis without delivering a following Speech Index
+# when an em dash is the final punctuation in a text block.  A comma preserves
+# the intended phrase break without exposing the legacy parser to U+2014 in
+# this position.  Include common closing quotes/brackets in the lookahead
+# because NVDA's symbol processing may preserve or remove them.
+_PHRASE_FINAL_EM_DASH = re.compile(r"\u2014(?=[\"'\u2019\u201d)\]}]*\s*$)")
+
+# openevv speaks the *name* of a bracket that whitespace separates from its
+# text -- "( hello )" comes out as "left paren hello right paren" -- where a
+# bracket touching its text stays silent and merely shapes the prosody.  Measured
+# against openevv v0.3 at 11025 Hz, "( hello world )" runs 2.83x longer than
+# "(hello world)"; brackets are 2.21x and braces 2.00x.  The proprietary engine
+# shows no such difference, so this is an openevv defect and the fix is applied
+# only on that backend, where it restores parity rather than changing behaviour.
+#
+# The affected set was measured, not assumed, and it is narrower than it looks:
+# colons, commas, periods, semicolons, dashes, apostrophes and angle brackets all
+# match the proprietary engine within noise and are deliberately left alone.
+# Timestamps need nothing either -- "12:30:45" does misread, but the existing
+# time_re in _eloquence_text.py already rewrites it into the form that does not.
+#
+# Both patterns require real text on the far side, so a bracket standing alone --
+# character navigation, or a symbol name NVDA has already spelled out -- keeps its
+# spacing and is still announced.
+_SPACED_OPEN_BRACKET = re.compile(r'([(\[{"])[ \t]+(?=[^\s)\]}])')
+_SPACED_CLOSE_BRACKET = re.compile(r'(?<=[^\s(\[{])[ \t]+([)\]}"])')
+
+
+def attach_spaced_brackets(text):
+	"""Join brackets to their adjacent text, keeping the punctuation itself.
+
+	Works around the openevv bug described above.  Only whitespace between a
+	bracket and its text is removed; nothing is added, removed or reordered, so
+	the engine still sees the same punctuation for prosody.
+	"""
+	text = _SPACED_OPEN_BRACKET.sub(r"\1", text)
+	return _SPACED_CLOSE_BRACKET.sub(r"\1", text)
+
+# ---------------------------------------------------------------------------
+# Crash prevention dictionaries
+# ---------------------------------------------------------------------------
+# Each dictionary maps a compiled regex to a replacement string.  _resub()
+# applies them in insertion order.
+
+english_fixes = {
+	re.compile(r"(\w+)\.([a-zA-Z]+)"): r"\1 dot \2",
+	re.compile(r"([a-zA-Z0-9_]+)@(\w+)"): r"\1 at \2",
+	# Mc prefix split crash (covers McName and McDONALD)
+	re.compile(r"\b(Mc)\s+([A-Z][a-z]|[A-Z][A-Z]+)"): r"\1\2",
+	# Date parser bug: "03 Marble" misread as "march ble".  The second space
+	# stops the engine's date parser fusing the number with the month-prefixed
+	# word.  Genuine full month names are excluded via lookahead so real dates
+	# ("14 March") still read as dates.  No pattern may ever *collapse* a
+	# double space: NVDA separates speech chunks (e.g. a "row 14" table
+	# announcement and a "March" cell) with two spaces, and removing that
+	# separator makes the engine read the chunks as one date.
+	re.compile(
+		r"\b(\d+) (?!(?:January|February|March|April|May|June|July|August"
+		r"|September|October|November|December)\b)"
+		r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+		r"([a-z]+)"
+	): r"\1  \2\3",
+	# caesure / cæsure crash
+	re.compile(r"c(ae|\xe6)sur(e)?", re.I): r"seizur",
+	# h' + r/v + e crash
+	re.compile(r"\b(|\d+|\W+)h'(r|v)[e]", re.I): r"\1h \2e",
+	# Consonant cluster + hhes + word continuation (variant 1)
+	re.compile(
+		r"\b(\w+[bdfhjlmnqrvz])(h[he]s)([abcdefghjklmnopqrstvwy]\w+)\b",
+		re.I,
+	): r"\1 \2\3",
+	# Consonant cluster + hhes + "iron" (variant 2)
+	re.compile(r"\b(\w+[bdfhjlmnqrvz])(h[he]s)(iron+[degins]?)", re.I): r"\1 \2\3",
+	# Apostrophe + consonant + hhes + word (variant 3, from IBMTTS)
+	re.compile(
+		r"\b(\w+'{1,}[bcdfghjklmnpqrstvwxyz])'*(h+[he]s)"
+		r"([abcdefghijklmnopqrstvwy]\w+)\b",
+		re.I,
+	): r"\1 \2\3",
+	# Consonant + apostrophe + hhes + word (variant 4, from IBMTTS)
+	re.compile(
+		r"\b(\w+[bcdfghjklmnpqrstvwxyz])('{1,}h+[he]s)"
+		r"([abcdefghijklmnopqrstvwy]\w+)\b",
+		re.I,
+	): r"\1 \2\3",
+	# Time-like + ordinal suffix (e.g. "2:30th")
+	re.compile(r"(\d):(\d\d[snrt][tdh])", re.I): r"\1 \2",
+	# Multiple apostrophe consonant clusters
+	re.compile(
+		r"\b([bcdfghjklmnpqrstvwxz]+)'([bcdefghjklmnpqrstvwxz']+)"
+		r"'([drtv][aeiou]?)",
+		re.I,
+	): r"\1 \2 \3",
+	# "you're'd" contractions
+	re.compile(r"\b(you+)'(re)+'([drv]e?)", re.I): r"\1 \2 \3",
+	# recosp / uncosp etc.
+	re.compile(r"(re|un|non|anti)cosp", re.I): r"\1kosp",
+	# EUR codes + digits
+	re.compile(r"(EUR[A-Z]+)(\d+)", re.I): r"\1 \2",
+	# tzsche (multi-group version from IBMTTS)
+	re.compile(
+		r"\b(\d+|\W+)?(\w+_+)?(_+)?([bcdfghjklmnpqrstvwxz]+)?(\d+)?"
+		r"t+z[s]che",
+		re.I,
+	): r"\1 \2 \3 \4 \5 tz sche",
+	# juar + long suffix
+	re.compile(r"(juar)([a-z']{9,})", re.I): r"\1 \2",
+}
+
+french_fixes = {
+	re.compile(r"([a-zA-Z0-9_]+)@(\w+)"): r"\1 arobase \2",
+	# "tranquille" crash: anquill -> anqill
+	re.compile(r"(?<=anq)uil(?=l)", re.I): r"i",
+	# "quil" at word boundary crash
+	re.compile(r"quil(?=\W)", re.I): r"kil",
+}
+
+spanish_fixes = {
+	re.compile(r"([a-zA-Z0-9_]+)@(\w+)"): r"\1 arroba \2",
+	# Euro/dollar amounts with thousands separators
+	re.compile(r"([\u20ac$]\d{1,3})((\s\d{3})+\.\d{2})"): r"\1 \2",
+	# Ordinal feminine marker after long numbers
+	re.compile(r"(\d{12,}[123679])(\xaa)"): r"\1 \2",
+}
+
+german_fixes = {
+	re.compile(r"dane-ben", re.I): r"dane- ben",
+	re.compile(r"dage-gen", re.I): r"dage- gen",
+	# Compound word crash: audio/video-en... (space, not `0 — backticks stripped)
+	re.compile(r"(audio|video)(-)(en[bcdfghjklmnpqrsvwxz][a-z]+)", re.I): r"\1 \3",
+	# Compound word crash: macro-en...
+	re.compile(r"(macro)(-)(en[a-z]+)", re.I): r"\1 \3",
+}
+
+# ---------------------------------------------------------------------------
+# Voice ID constants (from _eloquence.langs)
+# ---------------------------------------------------------------------------
+_ENGLISH_IDS = (65536, 65537)  # enu, eng
+_SPANISH_IDS = (131072, 131073)  # esp, esm
+_FRENCH_IDS = (196608, 196609)  # fra, frc
+_GERMAN_IDS = (262144,)  # deu
+_CHINESE_ID = (393216,)  # chs
+_KOREAN_ID = (655360,)  # kor
+_ASIAN_IDS = (393216, 524288, 655360)  # chs, jpn, kor
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _strip_accents(s):
+	"""Remove combining marks, leaving base characters."""
+	return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
+
+
+def _wchar_to_mbcs(text, code_page=0):
+	"""Encode Unicode to MBCS bytes using Windows best-fit character mapping.
+
+	Calls ``WideCharToMultiByte`` with *dwFlags=0*, which enables Windows
+	best-fit mapping for characters outside the target code page (e.g.
+	Đ→D, ł→l) instead of replacing them with ``?``.
+
+	Args:
+		text: Unicode string to convert.
+		code_page: Windows code page (0 = CP_ACP, the system default).
+
+	Returns:
+		Encoded bytes, or *None* if the conversion fails entirely.
+	"""
+	if not text:
+		return b""
+	_WideCharToMultiByte = ctypes.windll.kernel32.WideCharToMultiByte
+	size = _WideCharToMultiByte(code_page, 0, text, len(text), None, 0, None, None)
+	if size == 0:
+		return None
+	buf = ctypes.create_string_buffer(size)
+	if _WideCharToMultiByte(code_page, 0, text, len(text), buf, size, None, None) == 0:
+		return None
+	return buf.raw
+
+
+def _normalize_text(s):
+	"""Normalize text to fit the active MBCS code page.
+
+	Uses Windows best-fit character mapping via ``WideCharToMultiByte`` so
+	that characters like Đ and ł are mapped to their closest equivalents
+	(D, l) instead of being replaced with ``?``.
+	"""
+	encoded = _wchar_to_mbcs(s)
+	if encoded is not None:
+		try:
+			return encoded.decode("mbcs")
+		except UnicodeDecodeError:
+			pass
+	# Fallback: per-character approach (should rarely trigger)
+	result = []
+	for c in s:
+		char_bytes = _wchar_to_mbcs(c)
+		if char_bytes is not None:
+			try:
+				result.append(char_bytes.decode("mbcs"))
+				continue
+			except UnicodeDecodeError:
+				pass
+		cc = _strip_accents(c)
+		try:
+			cc.encode("mbcs")
+		except UnicodeEncodeError:
+			cc = "?"
+		result.append(cc)
+	return "".join(result)
+
+
+def _resub(dct, s):
+	"""Apply every regex/replacement pair in *dct* to *s* in order."""
+	for pattern, replacement in dct.items():
+		s = pattern.sub(replacement, s)
+	return s
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+def preprocess(text, voice_id):
+	"""Apply crash prevention fixes and text normalization for *voice_id*."""
+	text = _PHRASE_FINAL_EM_DASH.sub(",", text)
+	# Capital sharp s (ẞ, U+1E9E) is not in legacy Windows code pages and
+	# would be replaced with "?" by MBCS encoding.  Fall back to lowercase ß
+	# (U+00DF), which all Latin code pages recognise.  Applied globally
+	# because every Latin-based Eloquence voice can handle ß.
+	text = text.replace("\u1e9e", "\u00df")
+	# CHS and KOR get English fixes (they render embedded English text)
+	if voice_id in _ENGLISH_IDS + _CHINESE_ID + _KOREAN_ID:
+		text = _resub(english_fixes, text)
+	elif voice_id in _SPANISH_IDS:
+		text = _resub(spanish_fixes, text)
+	elif voice_id in _FRENCH_IDS:
+		text = _resub(french_fixes, text)
+	if voice_id in _GERMAN_IDS:
+		text = _resub(german_fixes, text)
+	if voice_id in _CHINESE_ID:
+		text = convert_traditional_to_simplified(text)
+	# Asian languages use multi-byte characters that would be corrupted
+	if voice_id not in _ASIAN_IDS:
+		text = _normalize_text(text)
+	return text

@@ -1,0 +1,12 @@
+Technical Skills Speech integration code
+
+Copyright (C) 2026 Technical Skills Solutions.
+
+The newly written unified NVDA SynthDriver and integration code in
+synthDrivers/technicalSkillsSpeech.py is licensed under the GNU General Public
+License, version 2 or (at your option) any later version.
+
+This notice does NOT relicense bundled third-party source code, binaries,
+voice data, dictionaries, or resource files. Those components retain their
+respective licenses, copyright notices, attribution terms, and permissions.
+See THIRD_PARTY_NOTICES.md and the files under LICENSES/.

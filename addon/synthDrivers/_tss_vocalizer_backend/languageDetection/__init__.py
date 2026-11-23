@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+
+from collections import defaultdict
+from io import StringIO
+from speech.commands import LangChangeCommand
+from .. import _config
+from .blocks import BLOCKS, BLOCK_RSHIFT
+
+BASIC_LATIN = [
+    u"en", u"ha", u"so", u"id", u"la", u"sw", u"eu",
+    u"nr", u"zu", u"xh", u"ss", u"st", u"tn", u"ts"
+]
+EXTENDED_LATIN = [
+    u"cs", u"af", u"pl", u"hr", u"ro", u"sk", u"sl", u"tr", u"hu", u"az",
+    u"et", u"sq", u"ca", u"es", u"gl", u"fr", u"de", u"nl", u"it", u"da", u"is", u"nb", u"sv",
+    u"fi", u"lv", u"pt", u"ve", u"lt", u"tl", u"cy", u"vi", "no"
+]
+ALL_LATIN = BASIC_LATIN + EXTENDED_LATIN
+
+CYRILLIC = [u"ru", u"uk", u"kk", u"uz", u"mn", u"sr", u"mk", u"bg", u"ky"]
+ARABIC = [u"ar", u"fa", u"ps", u"ur"]
+CJK = [u"zh", u"ja", u"ko"]
+
+SINGLETONS = {
+    u"Armenian" : u"hy",
+    u"Hebrew" : u"he",
+    u"Bengali" : u"bn",
+    u"Gurmukhi": u"pa",
+    u"Greek" : u"el",
+    u"Gujarati" : u"gu",
+    u"Oriya" : u"or",
+    u"Tamil" : u"ta",
+    u"Telugu" : u"te",
+    u"Kannada" : u"kn",
+    u"Malayalam" : u"ml",
+    u"Sinhala" : u"si",
+    u"Thai" : u"th",
+    u"Lao" : u"lo",
+    u"Tibetan" : u"bo",
+    u"Burmese" : u"my",
+    u"Georgian" : u"ka",
+    u"Mongolian" : u"mn-Mong",
+    u"Khmer" : u"km",
+}
+
+# Config keys to get languages to revert to, when in dobt
+_configKeys = {'CJK Unified Ideographs': 'CJKCharactersLanguage'}
+for charset in ('Basic Latin', 'Extended Latin', 'Latin Extended-B'):
+	_configKeys[charset] = 'latinCharactersLanguage'
+
+class LanguageDetector(object):
+	""" Provides functionality to add guessed language commands to NVDA speech sequences.
+	Unicode ranges and user configuration are used to guess the language."""
+
+	def __init__(self, availableLanguages):
+		# We only work with language codes yet, no dialects.
+		availableLanguages = frozenset(l.split("_")[0] for l in availableLanguages)
+		# Cache what are the unicode blocks supported by each language.
+		# Only cache for languages we have available
+		languageBlocks = defaultdict(lambda : [])
+		# Basic latin and extended latin are considered the same.
+		for l in (set(ALL_LATIN) & availableLanguages):
+			languageBlocks[l].extend([u"Basic Latin", u"Extended Latin"])
+		# Syrilic and arabic languages.
+		for l in (set(CYRILLIC) & availableLanguages):
+			languageBlocks[l].append(u"Cyrillic")
+		# For arabic.
+		for l in (set(ARABIC) & availableLanguages):
+			languageBlocks[l].extend([u"Arabic", u"Arabic Presentation Forms-A", u"Arabic Presentation Forms-B"])
+		# If we have korian, store its blocks.
+		if u"ko" in availableLanguages:
+			for block in [u"Hangul Syllables", u"Hangul Jamo", u"Hangul Compatibility Jamo", u"Hangul"]:
+				languageBlocks[u"ko"].append(block)
+			# Same for greek.
+		if u"el" in availableLanguages:
+			languageBlocks[u"el"].append(u"Greek and Coptic")
+		# And japonese.
+		if u"ja" in availableLanguages:
+			languageBlocks[u"ja"].extend([u"Kana", u"CJK Unified Ideographs"])
+		# Chinese (I have some dobts here).
+		if u"zh" in availableLanguages:
+			languageBlocks[u"zh"].extend([u"CJK Unified Ideographs", u"Bopomofo", u"Bopomofo Extended", u"KangXi Radicals"])
+		# Ad singletone languages (te only language for the range)
+		for k, v in SINGLETONS.items():
+			if v in availableLanguages:
+				languageBlocks[v].append(k)
+		self.languageBlocks = languageBlocks
+
+		# cache a reversed version of the hash table too.
+		blockLanguages = defaultdict(lambda : [])
+		for k, v in languageBlocks.items():
+			for i in v:
+				blockLanguages[i].append(k)
+		self.blockLanguages = blockLanguages
+
+	def add_detected_language_commands(self, speechSequence, defaultLang):
+		sb = StringIO()
+		charset = None
+		curLang = defaultLang
+		tmpLang = curLang.split("_")[0]
+		for command in speechSequence:
+			if isinstance(command, LangChangeCommand):
+				if command.lang is None:
+					curLang = defaultLang
+				else:
+					curLang = command.lang
+				tmpLang = curLang.split("_")[0]
+				yield command
+				charset = None # Whatever will come, reset the charset.
+			elif isinstance(command, str):
+				sb = StringIO()
+				command = str(command)
+				prevInIgnore = False
+				for c in command:
+					# For non-alphanumeric characters, revert to  the currently set language if in the ASCII range
+					block = ord(c) >> BLOCK_RSHIFT
+					if c.isspace():
+						sb.write(c)
+						continue
+					if c.isdigit() or (not c.isalpha() and block <= 0x8):
+						if _config.vocalizerConfig['autoLanguageSwitching']['ignoreNumbersInLanguageDetection'] and c.isdigit():
+							sb.write(c)
+							continue
+						if _config.vocalizerConfig['autoLanguageSwitching']['ignorePunctuationInLanguageDetection'] and not c.isdigit():
+							sb.write(c)
+							continue
+						if prevInIgnore:
+							# Digits and ascii punctuation. We already calculated
+							sb.write(c)
+							continue
+						prevInIgnore = True
+						charset = None # Revert to default charset, we don't care here and  have to recheck later
+						if tmpLang != curLang.split("_")[0]:
+							if sb.getvalue():
+								yield sb.getvalue()
+								sb = StringIO()
+							yield LangChangeCommand(curLang)
+							tmpLang = curLang.split("_")[0]
+						sb.write(c)
+						continue
+
+						# Process alphanumeric characters.
+					prevInIgnore = False
+					newCharset = BLOCKS[block]
+					if newCharset == charset:
+						sb.write(c)
+						continue
+					charset = newCharset
+					if charset in self.languageBlocks[tmpLang]:
+						sb.write(c)
+						continue
+					# Find the new language to use
+					newLang = self.find_language_for_charset(charset, curLang)
+					newLangFirst = newLang.split("_")[0]
+					if newLangFirst == tmpLang:
+						# Same old...
+						sb.write(c)
+						continue
+					# Change language
+					# First yield the string we already have.
+					if sb.getvalue():
+						yield sb.getvalue()
+						sb = StringIO()
+					tmpLang = newLangFirst
+					if newLang == curLang:
+						yield LangChangeCommand(newLang)
+					else:
+						yield LangChangeCommand(tmpLang)
+					sb.write(c)
+				# Send the string, if we have one:
+				if sb.getvalue():
+					yield sb.getvalue()
+			else:
+				yield command
+
+	def find_language_for_charset(self, charset, curLang):
+		langs = self.blockLanguages[charset]
+		if not langs or curLang.split("_")[0] in langs:
+			return curLang
+		# See if we have any configured language for this charset.
+		if charset in _configKeys:
+			configKey = _configKeys[charset]
+			lang = _config.vocalizerConfig['autoLanguageSwitching'][configKey]
+			return lang
+		return langs[0]

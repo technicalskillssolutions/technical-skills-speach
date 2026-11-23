@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Technical Skills Speech</title></head>
+<body>
+<h1>Technical Skills Speech</h1>
+<p>A unified NVDA synthesizer that routes speech between Eloquence and Vocalizer Expressive 2, with built-in offline Unicode-script language routing and the Hindi Neel voice resource.</p>
+<h2>Setup</h2>
+<p>Install the single Technical Skills Speech add-on, restart NVDA when prompted, then select Technical Skills Speech under NVDA Settings, Speech, Synthesizer.</p>
+<h2>Automatic mode</h2>
+<p>Automatic language detection is the default. Hindi Devanagari text uses Vocalizer Neel when available. English/Latin text uses Eloquence when available. Other scripts use a matching installed Vocalizer voice, then a matching Eloquence voice, then the fallback engine.</p>
+<h2>Settings</h2>
+<p>NVDA's synthesizer settings expose Voice, Variant, Rate, Pitch, Volume, and Inflection. Voice offers Automatic plus detected engine voices. Eloquence variants include Reed, Shelly, Bobby, Rocko, Glen, Sandy, Grandma, and Grandpa. Rate, pitch, volume, variant, and inflection are stored in independent per-engine/per-voice profiles. In Automatic mode, settings-ring changes update the profile of the most recently routed voice. To edit a particular voice, select it in the Voice list, change its settings, then return to Automatic.</p>
+<h2>Hindi short-word handling</h2>
+<p>Devanagari tokens of up to three letters are scoped with Vocalizer TN raw controls to prevent unwanted abbreviation expansion, then reset to normal text normalization after each token. Verify actual pronunciation on Windows with the embedded Neel voice.</p>
+<p>Website: <a href="https://technicalskillssolutions.github.io">technicalskillssolutions.github.io</a></p>
+<h2>Included Eloquence resources</h2>
+<p>The package includes all 13 .syn language resources supplied in the Eloquence v27 archive: Chinese, German, English (two variants), Spanish (two variants), Finnish, French (two variants), Italian, Japanese, Korean, and Brazilian Portuguese.</p>
+<h2>Important</h2>
+<p>Script detection cannot reliably identify Romanized Hindi or every language written in the Latin script. Explicit NVDA language metadata takes priority. Runtime testing on Windows/NVDA is required before a stable Store release.</p>
+<p>See the included README.md and THIRD_PARTY_NOTICES.md for detailed documentation and attribution. This package has not yet been runtime-tested inside Windows NVDA in the build environment; complete device-level and NVDA integration testing before a stable public release.</p>
+</body>
+</html>
